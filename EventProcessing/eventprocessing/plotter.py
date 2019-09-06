@@ -23,18 +23,37 @@ def plotter(locationsDict, averages):
         'X' : [],
         'Y' : [],
         'Z' : []
-        } for _ in range(33)]
+    } for _ in range(40)]
     for location in locationsDict:
         for i in range(len(averages[location['id']])):
             data[i]['X'] += [location['x']]
             data[i]['Y'] += [location['y']]
             data[i]['Z'] += [averages[location['id']][i]['averageValue']]
 
-    chosenIndex = 27
+    # for values in averages['25a7bbac-8b5d-425d-9d18-bf6079777f67']:
+    #     otherData = { [values['startTime']]}
+
+
+    # otherData = {}
+    # for location in locationsDict:
+    #     for values in averages[location['id']]:
+    #         otherData[values['startTime']]['X'] += [location['x']]
+    #         otherData[values['startTime']]['Y'] += [location['y']]
+    #         otherData[values['startTime']]['Z'] += [values['averageValue']]
+
+    chosenIndex = 2
     fig = plt.figure()
     ax = fig.gca(projection='3d')
     ax.plot_trisurf(data[chosenIndex]['X'],data[chosenIndex]['Y'],data[chosenIndex]['Z'], cmap=plt.cm.jet, linewidth=0.2)
     plt.show()
+
+    # for values in averages['25a7bbac-8b5d-425d-9d18-bf6079777f67']:
+    #         print(values['startTime'])
+
+    # chosenTime = '1567782188.3859286'
+    # fig = plt.figure()
+    # ax = fig.gca(projection='3d')
+    # ax.plot_trisurf(otherData[chosenTime]['X'],otherData[chosenTime]['Y'],otherData[chosenTime]['Z'], cmap=plt.cm.jet, linewidth=0.2)
     
 def runProg():
     locationsDict, averages = importFiles()
