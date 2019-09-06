@@ -18,7 +18,6 @@ topicArn = 'arn:aws:sns:eu-west-1:552908040772:EventProcessing-Stack1-snsTopicSe
 queueName = f'locationsQueueOW{random.randint(1,100)}'
 bucketName = 'eventprocessing-stack1-locationss3bucket-ivyo76ekdc6y'
 locationsKey = 'locations-part2.json'
-outputRawName = 'outputRaw.json'
 outputAverageName = 'outputAverageValue.json'
 averageCounter = {}
 
@@ -82,7 +81,7 @@ def startup():
     subscribeQueue(queueArn)
     return queue
 
-def writeAverageValue(end, messageArray, locationsDict):
+def writeAverageValue(endTime, messageArray, locationsDict):
     totalValue = {}
     numOfMessages = {}
     for location in locationsDict:
@@ -91,10 +90,14 @@ def writeAverageValue(end, messageArray, locationsDict):
 
     for messageDict in messageArray:
         for location in locationsDict:
-            for message in messageDict:
-                if (message['timestamp'] > (end - 360)*1000 and message['timestamp'] < (end - 300)*1000) and message['locationId']==location['id']:
-                    totalValue[location['id']] += message['value']
-                    numOfMessages[location['id']] += 1
+            for message in messageDict.values():
+                message = message[0]
+                try:
+                    if (message['timestamp'] > (endTime - 360)*1000 and message['timestamp'] < (endTime - 300)*1000) and message['locationId']==location['id']:
+                        totalValue[location['id']] += message['value']
+                        numOfMessages[location['id']] += 1
+                except KeyError:
+                    logging.warning(f'Key Error in: {message}')
 
     for location in locationsDict:
         if numOfMessages[location['id']] != 0:
@@ -105,15 +108,15 @@ def writeAverageValue(end, messageArray, locationsDict):
                     outfile.write(', ')
                 json.dump({
                     'averageValue': averageValue,
-                    'startTime': end - 360,
-                    'endTime': end - 300
+                    'startTime': endTime - 360,
+                    'endTime': endTime - 300
                 }, outfile)
             averageCounter[location['id']] += 1
 
 def doesMessageExistInDict(messageRead, messageDict):
     doesntAlreadyExists = True
     if any([messageRead['eventId'] == messageKey for messageKey in messageDict]):
-        print('hi')
+        logging.info('Duplicate message removed')
         doesntAlreadyExists = False
     return doesntAlreadyExists
 
@@ -124,25 +127,38 @@ def doesMessageExistAtAll(messageRead, messageArray):
     return alreadyExistsReduced
 
 def parseMessage(message):
-    messageBodyDict = ast.literal_eval(message.body)
-    messageDict = ast.literal_eval(messageBodyDict['Message'])
-    message.delete()
-    return messageDict
+    try:
+        messageBodyDict = ast.literal_eval(message.body)
+        messageDict = ast.literal_eval(messageBodyDict['Message'])
+        message.delete()
+        return messageDict
+    except SyntaxError:
+        logging.warning(f'Syntax Error in message {message.body}')
+        message.delete()        
+    except ValueError:
+        logging.warning(f'Value Error in message {message.body}')
+        message.delete()
 
 def processMessage(messageRead, messageArray, locationsDict):
-    if any([location['id'] == messageRead['locationId'] for location in locationsDict]):
-        doesntAlreadyExists = doesMessageExistAtAll(messageRead, messageArray)
-        if doesntAlreadyExists:
-            return messageRead
+    try:
+        if any([location['id'] == messageRead['locationId'] for location in locationsDict]):
+            doesntAlreadyExists = doesMessageExistAtAll(messageRead, messageArray)
+            if doesntAlreadyExists:
+                return messageRead
+    except KeyError:
+        logging.warning(f'Syntax Error in message {messageRead}')
+        return None
 
 def processMessagesThreading(messages, messageArray, locationsDict):
-    max_workers=25
+    max_workers=10
 
     with concurrent.futures.ThreadPoolExecutor(max_workers = max_workers) as executor:
         parsedMessagesFutures = [executor.submit(parseMessage, messages[i]) for i in range(len(messages))]
 
-    parsedMessages = reduce(lambda m1, m2: m1 + m2.result(), parsedMessagesFutures, [])
-    messagesCleaned = [dict(t) for t in {tuple(message.items()) for message in parsedMessages}]
+    parsedMessages = []
+    for parsedMessageFuture in parsedMessagesFutures:
+        parsedMessages += [parsedMessageFuture.result()]
+    messagesCleaned = [dict(t) for t in {tuple(message.items()) for message in parsedMessages if message is not None }]
 
     with concurrent.futures.ThreadPoolExecutor(max_workers = max_workers) as executor:
         processedMessages = [executor.submit(processMessage, messagesCleaned[i], messageArray, locationsDict) for i in range(len(messagesCleaned))]
@@ -157,14 +173,12 @@ def getMessages(queue):
     return queue.receive_messages(AttributeNames=['All'], MaxNumberOfMessages=10)
 
 def getMessagesThreading(queue):
-    max_workers=10
+    max_workers=1
 
     with concurrent.futures.ThreadPoolExecutor(max_workers = max_workers) as executor:
         messagesFutures = [executor.submit(getMessages, queue) for _ in range(max_workers)]
 
     messages = reduce(lambda m1, m2: m1 + m2.result(), messagesFutures, [])
-    print(len(messages))
-    print(f'Queueueueue length: {queue.attributes["ApproximateNumberOfMessages"]}')
     return messages
 
 def logMessages(queue):
@@ -179,24 +193,19 @@ def logMessages(queue):
     startCounter = 0
     messageArray = [{} for i in range(14)]
     messageArray[0] = {}
+    excepter = True
 
     try:
         logging.info('Taking messages from queue')
         while True:
             messages = getMessagesThreading(queue)
             messageArray = processMessagesThreading(messages, messageArray, locationsDict)
-                    
-                # except :
-                #     logging.warning(f'Error in message {message.body}')
-                #     message.delete()
-
-            
             endTime = time.time()
 
             if endTime - startTime > 30:
                 startCounter += 1
                 logging.info(f'Queue is of approximate size: {queue.attributes["ApproximateNumberOfMessages"]}')
-                if startCounter >= 5:
+                if startCounter >= 5 and startCounter % 2 == 0:
                     writeAverageValue(endTime, messageArray, locationsDict)
                 startTime = time.time()
 
@@ -211,8 +220,16 @@ def logMessages(queue):
         for location in locationsDict:
             with open(f"outputs/{outputAverageName}AtID{location['id']}.json", "a") as outfile:
                 outfile.write(']')
-
         queue.delete()
+        excepter = False
+
+    finally:
+        if excepter:
+            print('Shutting Down Horribly')
+            for location in locationsDict:
+                with open(f"outputs/{outputAverageName}AtID{location['id']}.json", "a") as outfile:
+                    outfile.write(']')
+            queue.delete()
 
 def runProg():
     queue = startup()
