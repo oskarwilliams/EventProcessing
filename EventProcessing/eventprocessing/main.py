@@ -1,10 +1,28 @@
 import boto3
 import ast
 import json
-import time
 import logging
+import cProfile
+import pstats
+from pstats import SortKey
+import concurrent.futures
+import threading
+import random
+import time
+from functools import reduce
 
-def allow_sns_to_write_to_sqs(topicarn, queuearn):
+thread_local = threading.local()
+
+topicArn = 'arn:aws:sns:eu-west-1:552908040772:EventProcessing-Stack1-snsTopicSensorDataPart2-7992TP4VVW59'
+# topicArn = 'arn:aws:sns:eu-west-1:552908040772:EventProcessing-Stack1-snsTopicSensorDataPart1-MEC8N0UVX4AR'
+queueName = f'locationsQueueOW{random.randint(1,100)}'
+bucketName = 'eventprocessing-stack1-locationss3bucket-ivyo76ekdc6y'
+locationsKey = 'locations-part2.json'
+outputRawName = 'outputRaw.json'
+outputAverageName = 'outputAverageValue.json'
+averageCounter = {}
+
+def allow_sns_to_write_to_sqs(queueArn):
     policy_document = """{{
   "Version":"2012-10-17",
   "Statement":[
@@ -21,25 +39,25 @@ def allow_sns_to_write_to_sqs(topicarn, queuearn):
       }}
     }}
   ]
-}}""".format(queuearn, topicarn)
+}}""".format(queueArn, topicArn)
 
     return policy_document
 
 
-def connectToBucket(bucketName):
+def connectToBucket():
     s3 = boto3.resource('s3')
     logging.info(f'Connecting to S3 Bucket: {bucketName}')
     bucket = s3.Bucket(bucketName)
-    logging.info('Downloading locations.json')
-    bucket.download_file('locations.json', 'locations.json')
+    logging.info(f'Downloading: {locationsKey}')
+    bucket.download_file(locationsKey, 'locations.json')
     return bucket
 
-def setupQueue(queueName, topicArn):
+def setupQueue():
     sqs = boto3.resource('sqs')
     logging.info(f'Creating queue: {queueName}')
     queue = sqs.create_queue(QueueName=queueName)
     queueArn = queue.attributes.get('QueueArn')
-    policy_json = allow_sns_to_write_to_sqs(topicArn, queueArn)
+    policy_json = allow_sns_to_write_to_sqs(queueArn)
     response = boto3.client('sqs').set_queue_attributes(
         QueueUrl=queue.url,
         Attributes={
@@ -48,10 +66,9 @@ def setupQueue(queueName, topicArn):
     )
     return queue, queueArn
 
-
-def subscribeQueue(topicArn, queueArn):
+def subscribeQueue(queueArn):
     sns = boto3.resource('sns')
-    logging.info('Subscribing queue to topic: ' + topicArn)
+    logging.info(f'Subscribing queue to topic: {topicArn}')
     topic = sns.Topic(topicArn)
     notifier = topic.subscribe(
         Protocol='sqs',
@@ -59,120 +76,150 @@ def subscribeQueue(topicArn, queueArn):
         ReturnSubscriptionArn=True
     )
 
-
-def startup(topicArn, queueName, bucketName):
-
-    connectToBucket(bucketName)
-    queue, queueArn = setupQueue(queueName, topicArn)
-    subscribeQueue(topicArn, queueArn)
+def startup():
+    connectToBucket()
+    queue, queueArn = setupQueue()
+    subscribeQueue(queueArn)
     return queue
 
+def writeAverageValue(end, messageArray, locationsDict):
+    totalValue = {}
+    numOfMessages = {}
+    for location in locationsDict:
+        totalValue[location['id']] = 0
+        numOfMessages[location['id']] = 0
 
-def writeAverageValue(averageCounter, end, messageArrays, outputName):
-    totalValue = 0
-    numOfMessages = 0
+    for messageDict in messageArray:
+        for location in locationsDict:
+            for message in messageDict:
+                if (message['timestamp'] > (end - 360)*1000 and message['timestamp'] < (end - 300)*1000) and message['locationId']==location['id']:
+                    totalValue[location['id']] += message['value']
+                    numOfMessages[location['id']] += 1
 
-    for messageArray in messageArrays:
-        for message in messageArray:
-            if message['timestamp'] > (end - 360)*1000 and message['timestamp'] < (end - 300)*1000:
-                totalValue += message['value']
-                numOfMessages += 1
+    for location in locationsDict:
+        if numOfMessages[location['id']] != 0:
+            averageValue = totalValue[location['id']]/numOfMessages[location['id']]
 
-    if numOfMessages != 0:
-        averageValue = totalValue/numOfMessages
+            with open(f"outputs/{outputAverageName}AtID{location['id']}.json", "a") as outfile:
+                if averageCounter[location['id']] != 0:
+                    outfile.write(', ')
+                json.dump({
+                    'averageValue': averageValue,
+                    'startTime': end - 360,
+                    'endTime': end - 300
+                }, outfile)
+            averageCounter[location['id']] += 1
 
-        with open(f"outputs/{outputName}", "a") as outfile:
-            if averageCounter != 0:
-                outfile.write(', ')
-            json.dump({
-                'averageValue': averageValue,
-                'startTime': end - 360,
-                'endTime': end - 300
-            }, outfile)
-        averageCounter += 1
-    return averageCounter
+def doesMessageExistInDict(messageRead, messageDict):
+    doesntAlreadyExists = True
+    if any([messageRead['eventId'] == messageKey for messageKey in messageDict]):
+        print('hi')
+        doesntAlreadyExists = False
+    return doesntAlreadyExists
 
+def doesMessageExistAtAll(messageRead, messageArray):
+    for messageDict in messageArray:
+        alreadyExists = [doesMessageExistInDict(messageRead, messageDict)]
+    alreadyExistsReduced = all(alreadyExists)
+    return alreadyExistsReduced
 
-def writeRawOutput(messageDict, messageArrays, locationsDict, rawCounter, outputName):
+def parseMessage(message):
+    messageBodyDict = ast.literal_eval(message.body)
+    messageDict = ast.literal_eval(messageBodyDict['Message'])
+    message.delete()
+    return messageDict
 
-    if len(list(filter(lambda location: location['id'] == messageDict['locationId'], locationsDict))) != 0:
-        doesntAlreadyExists = True
-        for messageArray in messageArrays:
-            if messageDict in messageArray:
-                doesntAlreadyExists = False
-
+def processMessage(messageRead, messageArray, locationsDict):
+    if any([location['id'] == messageRead['locationId'] for location in locationsDict]):
+        doesntAlreadyExists = doesMessageExistAtAll(messageRead, messageArray)
         if doesntAlreadyExists:
-            # with open(f"outputs/{outputName}", "a") as outfile:
-            #     if rawCounter != 0:
-            #         outfile.write(', ')
-            #     json.dump(messageDict, outfile)
-            rawCounter += 1
-            messageArrays[0] += [messageDict]
-    return messageArrays, rawCounter
+            return messageRead
 
+def processMessagesThreading(messages, messageArray, locationsDict):
+    max_workers=25
 
-def logMessages(queue, outputRawName, outputAverageName):
+    with concurrent.futures.ThreadPoolExecutor(max_workers = max_workers) as executor:
+        parsedMessagesFutures = [executor.submit(parseMessage, messages[i]) for i in range(len(messages))]
+
+    parsedMessages = reduce(lambda m1, m2: m1 + m2.result(), parsedMessagesFutures, [])
+    messagesCleaned = [dict(t) for t in {tuple(message.items()) for message in parsedMessages}]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers = max_workers) as executor:
+        processedMessages = [executor.submit(processMessage, messagesCleaned[i], messageArray, locationsDict) for i in range(len(messagesCleaned))]
+
+    for processedMessage in processedMessages:
+        message = processedMessage.result()
+        if message != None:
+            messageArray[0][message['eventId']] = [message]
+    return messageArray
+
+def getMessages(queue):
+    return queue.receive_messages(AttributeNames=['All'], MaxNumberOfMessages=10)
+
+def getMessagesThreading(queue):
+    max_workers=10
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers = max_workers) as executor:
+        messagesFutures = [executor.submit(getMessages, queue) for _ in range(max_workers)]
+
+    messages = reduce(lambda m1, m2: m1 + m2.result(), messagesFutures, [])
+    print(len(messages))
+    print(f'Queueueueue length: {queue.attributes["ApproximateNumberOfMessages"]}')
+    return messages
+
+def logMessages(queue):
     with open('locations.json', 'r') as infile:
         locationsDict = json.load(infile)
-    # with open(f"outputs/{outputRawName}", "w") as outfile:
-        # outfile.write('[')
-    with open(f"outputs/{outputAverageName}", "w") as outfile:
-        outfile.write('[')
+    for location in locationsDict:
+        averageCounter[location['id']] = 0
+        with open(f"outputs/{outputAverageName}AtID{location['id']}.json", "w") as outfile:
+            outfile.write('[')
 
     startTime = time.time()
-    rawCounter = 0
-    averageCounter = 0
-    messageArrays = [[]]
-    messageArrays[0] = []
+    startCounter = 0
+    messageArray = [{} for i in range(14)]
+    messageArray[0] = {}
 
     try:
         logging.info('Taking messages from queue')
-        logging.info(f'Start time is {startTime}')
         while True:
+            messages = getMessagesThreading(queue)
+            messageArray = processMessagesThreading(messages, messageArray, locationsDict)
+                    
+                # except :
+                #     logging.warning(f'Error in message {message.body}')
+                #     message.delete()
 
-            messages = queue.receive_messages(AttributeNames=[
-                'All'
-            ],
-                MaxNumberOfMessages=10,
-                WaitTimeSeconds=10,
-            )
-
-            for message in messages:
-                messageBodyDict = ast.literal_eval(message.body)
-                messageDict = ast.literal_eval(messageBodyDict['Message'])
-                messageArrays, rawCounter = writeRawOutput(
-                    messageDict, messageArrays, locationsDict, rawCounter, outputRawName)
-                message.delete()
-
+            
             endTime = time.time()
 
-            if endTime - startTime > 60:
-
-                averageCounter = writeAverageValue(
-                    averageCounter, endTime, messageArrays, outputAverageName)
+            if endTime - startTime > 30:
+                startCounter += 1
+                logging.info(f'Queue is of approximate size: {queue.attributes["ApproximateNumberOfMessages"]}')
+                if startCounter >= 5:
+                    writeAverageValue(endTime, messageArray, locationsDict)
                 startTime = time.time()
 
-                for i in range(9, 0):
+                for i in range(14, 0):
                     if i == 0:
-                        messageArrays[i] = []
+                        messageArray[i] = []
                     else:
-                        messageArrays[i] = messageArrays[i-1]
+                        messageArray[i] = messageArray[i-1]
 
     except KeyboardInterrupt:
         print('Shutting Down Gracefully')
-        # with open(f"outputs/{outputRawName}", "a") as outfile:
-        #     outfile.write(']')
-        with open(f"outputs/{outputAverageName}", "a") as outfile:
-            outfile.write(']')
+        for location in locationsDict:
+            with open(f"outputs/{outputAverageName}AtID{location['id']}.json", "a") as outfile:
+                outfile.write(']')
 
         queue.delete()
 
+def runProg():
+    queue = startup()
+    logMessages(queue)
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    topicArn = 'arn:aws:sns:eu-west-1:552908040772:EventProcessing-Stack1-snsTopicSensorDataPart1-MEC8N0UVX4AR'
-    queueName = 'locationsQueueOW'
-    bucketName = 'eventprocessing-stack1-locationss3bucket-ivyo76ekdc6y'
-    outputRawName = 'outputRaw.json'
-    outputAverageName = 'outputAverageValue.json'
-    queue = startup(topicArn, queueName, bucketName)
-    logMessages(queue, outputRawName, outputAverageName)
+    # runProg()
+    cProfile.run('runProg()', 'restats')
+    pstats.Stats('restats').sort_stats(SortKey.TIME).print_stats('main')
